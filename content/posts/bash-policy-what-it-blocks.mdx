@@ -1,0 +1,82 @@
+---
+title: "bash 的允許清單擋得住什麼、擋不住什麼：15 個指令實測"
+date: "2026-10-06"
+tag: "踩坑紀錄"
+series: "agent-harness-from-scratch"
+order: 6
+excerpt: "我在 bash 之上加了 allow/deny list，並補強了幾種常見的繞過寫法。實際跑了 15 個指令，還是有 5 種繞過寫法會通過。"
+draft: true
+---
+
+## 問題
+
+bash 能做任何 shell 做得到的事。在進入沙箱之前，我先在它上面加一層**指令政策**：執行前檢查，不合規就不啟動 shell。
+
+## 設計
+
+| 常數 | 意義 | 空集合時 |
+|---|---|---|
+| `ALLOW_LIST` | 只允許這些指令 | 不限制 |
+| `DENY_LIST` | 禁止這些指令 | 不禁止 |
+| `CHAIN_SEPARATORS` | `&&`、`\|\|`、`;`、`\|`、`&`、換行 | — |
+
+規則：
+
+- 用分隔符號把指令切成多段，**每一段的第一個 token** 都要檢查。所以 `cd notes && rm -rf x` 會同時檢查 `cd` 和 `rm`，不會因為開頭是安全指令就放行
+- **Deny 優先**：同一個指令同時在兩個清單時拒絕，和 IAM、防火牆的慣例一致
+- **檢查在啟動 shell 之前**：被拒絕時沒有任何副作用，只回傳 `[policy: 'dd' is on the deny list; refusing to run]` 給模型，讓它換個做法
+
+## 我補強的兩個地方
+
+**1. 取指令名稱時去掉偽裝**
+
+```python
+def _first_token(segment: str) -> str:
+    for token in segment.strip().lstrip("({").split():
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", token):
+            continue                      # 跳過 FOO=1 這類前綴
+        return Path(token.strip("'\"")).name   # /bin/rm -> rm
+    return ""
+```
+
+這樣 `/bin/rm x`、`FOO=1 rm x`、`(rm x)` 都會被認成 `rm`。
+
+**2. 不在引號裡切割**
+
+原本 `python -c "import a; print(1)"` 會被 `;` 切開，`print(1)"` 被當成指令名稱而遭拒。我把 `_segments` 改成逐字元掃描，略過引號內的分隔符號。
+
+## 實測：15 個指令
+
+用 repo 目前的設定（允許直譯器、檔案檢視工具和 git；拒絕 `rm`、`sudo`、`dd`、`mv`、`mkfs`）直接呼叫 `_check_policy`：
+
+| 指令 | 結果 | 原因 |
+|---|---|---|
+| `rm -rf notes` | 擋下 | deny list |
+| `/bin/rm -rf notes` | 擋下 | 去掉路徑後是 `rm` |
+| `FOO=1 rm x` | 擋下 | 跳過變數前綴 |
+| `(rm x)` | 擋下 | 跳過 `(` |
+| `cd notes && rm -rf x` | 擋下 | 第二段是 `rm` |
+| `ls \| xargs rm` | 擋下 | `xargs` 不在 allow list |
+| `bash -c "rm x"` | 擋下 | `bash` 不在 allow list |
+| `curl https://example.com` | 擋下 | `curl` 不在 allow list |
+| `env` | 擋下 | `env` 不在 allow list |
+| `python -c "import a; print(1)"` | 通過 | 正常指令，引號內的 `;` 不再誤切 |
+| `echo $(rm x)` | **通過** | `$(...)` 裡的指令不會被切出來檢查 |
+| `` echo `rm x` `` | **通過** | 反引號同上 |
+| `python -c "import shutil; shutil.rmtree('x')"` | **通過** | 允許 `python` 就等於允許任意程式碼 |
+| `find . -delete` | **通過** | `find` 本身就能刪檔 |
+| `echo $OPENAI_API_KEY` | **通過** | 變數展開不在檢查範圍 |
+
+注意 `xargs`、`bash -c` 被擋下，是因為現在是**鎖定模式**（allow list 不為空）。如果切回寬鬆模式（allow list 空、只用 deny list），它們都會通過。
+
+## 學到什麼
+
+這是**字串比對，不是隔離**。它擋得住明顯的錯誤，也擋得住幾種常見的偽裝，但擋不住任何「把動作包在別的指令裡」的寫法，而允許 `python` 本身就打開了一扇任意程式碼的門。
+
+所以它的定位是第一道防線：防止 agent 意外執行危險指令，並給模型清楚的回饋。真正的防護要靠作業系統層的隔離，也就是下一個階段的沙箱。
+
+<Callout type="limit" title="測試範圍">
+以上是直接呼叫政策檢查函式的結果，只說明「指令會不會被放行」，沒有實際執行這些指令。測試的是 repo 在 commit 26dd2bb 時的程式碼與清單設定。
+</Callout>
+
+程式碼：[Poyuchao/Harness-Engineering](https://github.com/Poyuchao/Harness-Engineering)

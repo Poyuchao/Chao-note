@@ -1,0 +1,80 @@
+---
+title: "ReAct loop 與 step budget：離開迴圈只能有兩種方式"
+date: "2026-10-06"
+tag: "Agent 架構"
+series: "agent-harness-from-scratch"
+order: 5
+excerpt: "把單輪工具呼叫改成 ReAct loop 之後，agent 第一次能自己推動「行動、觀察」的循環。真正的細節在怎麼停下來。"
+draft: true
+---
+
+## 問題
+
+前幾篇一直撞到同一面牆：每一輪只能呼叫一次工具。「寫 `fib.py`、執行、給我看結果」要拆成好幾句指令，**是我在一步步牽著 agent 走到終點**，而不是它自己做完。
+
+## 兩層迴圈
+
+外層是使用者的 session，內層是單一 turn 的 ReAct loop：呼叫模型（reason）→ 執行工具（act）→ 結果寫回歷史（observe）→ 再呼叫模型，直到它給出純文字回答。
+
+```python
+step_count = 0
+while True:
+    message = _call_model(messages)
+
+    if not message.tool_calls:          # 1. 沒有工具呼叫：已經有答案
+        break
+
+    if step_count >= STEP_BUDGET:       # 2. 預算用完：強制收尾
+        messages.append({"role": "system", "content": BUDGET_EXCEEDED_MESSAGE})
+        message = _call_model(messages, tool_choice="none")
+        break
+
+    messages.append(message.model_dump(exclude_none=True))
+    for call in message.tool_calls:
+        args = json.loads(call.function.arguments)
+        result = registry.dispatch(call.function.name, args)
+        messages.append({"role": "tool", "tool_call_id": call.id, "content": result})
+    step_count += 1
+```
+
+**離開 ReAct loop 只有兩種方式**：模型不再呼叫工具，或達到 step budget。
+
+## Step budget 的三個細節
+
+`STEP_BUDGET = 25`，每個 user turn 最多 25 輪工具呼叫，避免無限迴圈和 API 費用失控。達到上限時，我注入一則合成的 system 訊息，要求模型回報三件事：這一輪完成了什麼、還剩什麼、使用者下一步該問什麼，讓工作能接著做下去。
+
+實作時有三個容易寫錯的地方：
+
+1. **預算檢查放在執行工具之前**。被擋下的工具呼叫不能寫進歷史，否則會留下一個沒有對應結果的 tool call，下一次呼叫 API 就會報錯
+2. **收尾的那次呼叫帶 `tool_choice="none"`**。只在 prompt 裡寫「不要再呼叫工具」是 soft constraint；用參數禁止，模型在技術上就不可能再呼叫
+3. **預算數字從常數帶入**，不寫死在訊息文字裡
+
+## 移除佔位字串，改成大聲報錯
+
+以前因為每輪只能呼叫一次工具，我用一個 `(no text response - used tools only)` 佔位字串頂著。有了 ReAct loop 之後，跳出迴圈時 `content` 應該一定有文字，所以我把佔位拿掉，改成直接 `raise`：
+
+```python
+if not assistant_text:
+    raise RuntimeError(
+        "ReAct loop ended but message.content is empty. This shouldn't "
+        "happen; check the API response and the loop's termination logic."
+    )
+```
+
+如果還是空的，代表發生了不該發生的事：API 的邊界情況、終止邏輯有 bug，或是額度用完了。**默默的備案會掩蓋真正的問題。**
+
+## 效果
+
+| 指令 | 結果 |
+|---|---|
+| 寫 `fib.py`、執行、顯示輸出 | 一句指令完成 |
+| 讀取不存在的 `config.json` 並印出 keys | 探索之後主動問我要不要建立範例檔 |
+| 建立含 `pyproject.toml`、`src/` 和模組的專案，執行驗證後 commit | 一次完成，混用檔案、bash、git 工具 |
+
+第二項是我最喜歡的觀察：有了 ReAct loop，**agent 只會在缺少它自己拿不到的資訊時才停下來問人**。
+
+## 學到什麼
+
+ReAct loop 本身很短，難的是終止條件：什麼時候停、停下來時歷史要長什麼樣子、異常時要不要假裝沒事。之前所有「單輪工具上限」的限制到這裡解除，但 bash 現在能連續執行任何指令了，下一篇處理它的權限。
+
+程式碼：[Poyuchao/Harness-Engineering](https://github.com/Poyuchao/Harness-Engineering)

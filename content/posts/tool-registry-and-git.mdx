@@ -1,0 +1,95 @@
+---
+title: "工具註冊表與 git：讓 agent 真的動手，而且敢動手"
+date: "2026-10-05"
+tag: "Agent 架構"
+series: "agent-harness-from-scratch"
+order: 2
+excerpt: "一個 @tool 裝飾器、一道路徑檢查，再加上六個 git 工具。版本控制不是 prompt 裡的建議，而是 harness 的基本能力。"
+draft: true
+---
+
+## 問題
+
+上一篇的迴圈只會說話。要讓它真的讀寫檔案，就得給它工具。但我不想每加一個工具就改一次迴圈，所以先做一個通用的**工具註冊表**。
+
+## 用一個裝飾器登記工具
+
+```python
+def tool(fn):
+    registry.register(
+        Tool(
+            name=fn.__name__,
+            description=inspect.getdoc(fn) or "",
+            fn=fn,
+            schema=TypeAdapter(fn).json_schema(),
+        )
+    )
+    return fn
+```
+
+`@tool` 在 **import 的時候**就執行：函式名稱當工具名、docstring 當說明、用 pydantic 的 `TypeAdapter` 從型別標註產生參數 schema，然後登記進 registry。最後回傳原函式，所以它仍然可以正常呼叫。
+
+依賴是單向的：檔案工具認識 registry，registry 不認識任何工具。新增工具完全不用改 registry。
+
+這裡有一個我覺得很重要的觀察：模型選哪個工具，是根據工具的名稱、說明、system prompt 和對話內容自己決定的。所以 **docstring 本身就是 prompt**，寫得不清楚，模型就選不準。
+
+## 錯誤要回傳，不要 raise
+
+```python
+def dispatch(self, name: str, args: dict) -> str:
+    if name not in self._tools:
+        return f"Error: unknown tool '{name}'"
+    try:
+        return str(self._tools[name].fn(**args))
+    except Exception as e:
+        return f"Error: {e}"
+```
+
+工具出錯時把錯誤當成文字交給模型，讓它看得到哪裡出問題、能向使用者解釋或換個方法，而不是讓整個程式崩潰。
+
+## 第一個 hard constraint：路徑不能逃出 workspace
+
+五個檔案工具（`read_file`、`write_file`、`list_dir`、`make_dir`、`delete_file`）全部經過同一道檢查：
+
+```python
+def _resolve_path(path: str) -> Path:
+    target = (WORKSPACE / path).resolve()
+    if not target.is_relative_to(WORKSPACE):
+        raise ValueError(f"Path '{path}' escapes the workspace")
+    return target
+```
+
+先 `resolve()` 再比對，`../` 和絕對路徑都會被擋下來。這是整個 harness 第一個寫在程式碼裡、模型怎麼說都繞不過的限制。
+
+但我也注意到它的邊界：這只保護**檔案工具**。之後一旦給 agent bash，模型直接 `cat ../../某個檔案` 就繞過去了。這件事後面會一直回來。
+
+## 為什麼版本控制要做成工具
+
+只有檔案工具時，每次寫入都無法復原，每個錯誤都是永久的。結果是 agent 變得保守又緩慢。有了 git，流程變成：先 commit 穩定狀態 → 開 branch 嘗試 → 錯了就 rollback。**版本控制擴大了 agent 敢嘗試的範圍。**
+
+| 能力 | 工具 |
+|---|---|
+| Commit（存檔點） | `git_status`、`git_diff`、`git_commit` |
+| Rollback | `git_log`、`git_checkout` |
+| Branching | `git_branch`、`git_checkout` |
+
+刻意**不做**的：push、pull、fetch（遠端）、merge（衝突需要和使用者來回溝通）、stash、rebase。等真的需要再加。
+
+實作上直接呼叫 git binary，而不是用 GitPython，理由有三個：行為和開發者在終端機裡看到的一樣、不增加依賴，以及**模型對 git 原始輸出的熟悉度遠高於 GitPython 的物件**。
+
+幾個細節：
+
+- workspace 在 import 時自動 `git init`，user 設成 `agent`、預設分支 `main`。和自動建立 workspace 一樣，做成 hard constraint，不靠模型記得
+- `git_checkout` 與 `git_branch` 拒絕 `-` 開頭的名稱，避免被當成 `--orphan` 這類選項
+- 專案根目錄的 `.gitignore` 要排除 `.workspace/`，否則 workspace 的 `.git` 會和外層 repo 打架
+- commit 的習慣（常做小 commit、危險操作前先 commit）寫在 system prompt 裡，這部分是 soft
+
+## 撞到的限制
+
+這時候的迴圈每一輪只能處理一次工具呼叫。「寫檔然後 commit」需要兩次來回，做不到；第二次回應如果又是工具呼叫，`content` 是 `None`，我只能先用一個佔位字串頂著。這個問題要等 ReAct loop 才解決。
+
+## 學到什麼
+
+工具註冊表讓「新增工具」和「迴圈」解耦；錯誤回傳成文字讓失敗變成模型看得到的資訊；路徑檢查和自動 `git init` 則是把「一定要成立的事」寫進程式碼。下一篇處理跨 session 的記憶。
+
+程式碼：[Poyuchao/Harness-Engineering](https://github.com/Poyuchao/Harness-Engineering)

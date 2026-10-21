@@ -1,0 +1,23 @@
+[
+  {
+    "id": "agent-harness-from-scratch",
+    "title": "從零理解 Agent Harness",
+    "status": "連載中",
+    "desc": "不用框架，一層一層手刻 agent 的外殼：從 while 迴圈到沙箱。",
+    "chips": ["Loop", "Tools", "Context", "Environment", "Memory", "Observability"]
+  },
+  {
+    "id": "agent-frameworks",
+    "title": "Agent 框架比較",
+    "status": "連載中",
+    "desc": "用同一組六大元件的角度，看每個框架幫你做了什麼、留了什麼給你。",
+    "chips": ["OpenAI Agents SDK", "CrewAI", "LangGraph", "AutoGen", "MCP"]
+  },
+  {
+    "id": "rag-basics-to-agentic",
+    "title": "RAG 從基礎到 Agentic",
+    "status": "規劃中",
+    "desc": "從固定檢索一次，到讓模型自己判斷要不要查、查得夠不夠。",
+    "chips": ["Chunking", "混合檢索", "Rerank", "Corrective RAG", "Self-RAG", "評測"]
+  }
+]

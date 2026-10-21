@@ -1,0 +1,83 @@
+---
+title: "Agent 就是一個 while 迴圈：從 bare loop 到 system prompt"
+date: "2026-10-05"
+tag: "Agent 架構"
+series: "agent-harness-from-scratch"
+order: 1
+excerpt: "模型沒有記憶，記憶來自每次重送整段對話。先把最陽春的迴圈寫出來，才看得清楚後面每一層在補什麼。"
+draft: true
+---
+
+## 問題
+
+我想自己手刻一個 coding agent 的外殼（harness），不用 LangGraph 這類框架。第一步先回答一個最基本的問題：一個 agent 最少需要什麼？
+
+答案比我想像的少：**agent 就是包在無狀態模型外面的 while 迴圈。**
+
+## 最陽春的迴圈
+
+模型本身沒有記憶。它之所以「記得」你剛剛說的話，是因為每次呼叫時，我都把**整段對話歷史**重新送進去。
+
+```python
+messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+while True:
+    user_input = input("You: ").strip()
+    if user_input.lower() in ("quit", "exit"):
+        break
+    if not user_input:
+        continue
+
+    messages.append({"role": "user", "content": user_input})
+    response = client.chat.completions.create(model=MODEL, messages=messages)
+    reply = response.choices[0].message.content
+    messages.append({"role": "assistant", "content": reply})
+    print(f"\nAgent: {reply}\n")
+```
+
+兩次 `append` 缺一不可：少了使用者的訊息，模型不知道你問了什麼；少了自己的回覆，下一輪它就不記得自己說過什麼。
+
+我告訴它「我叫 George」，下一題問「我叫什麼」，它答得出來。但這不是記憶，只是名字剛好在送進去的 `messages` 裡。
+
+## System prompt：槓桿最大的一段文字
+
+System prompt 就是 `messages` 裡第一則 `role: "system"` 的訊息。因為放在最前面，**每一輪都會被看到**，所以一句好話影響每一次回答，一句壞話會造成很難 debug 的問題。
+
+我把它的工作拆成四種，需要時才加，不必全部都有：
+
+| 職責 | 這個 harness 裡的寫法 |
+|---|---|
+| Identity | 在終端機裡協助開發者的 coding assistant |
+| Capabilities | 有哪些工具、能做什麼，避免模型幻想自己有某種能力 |
+| Constraints | 能做與不能做的事 |
+| Output conventions | 簡潔、程式碼用 fenced code block 並標註語言 |
+
+最重要的區分是 **soft constraint 與 hard constraint**：
+
+- **Soft**：寫在 prompt 裡。模型可能忽略、換一個模型可能解讀不同、使用者也可能用話術繞過。
+- **Hard**：寫在 harness 的程式碼裡，例如根本不提供刪除工具。怎麼說都繞不過。
+
+這個原則貫穿整個專案：**一定要發生、或一定不能發生的事，都寫在程式碼裡。**
+
+## 一個踩到的坑
+
+我把依賴鎖在 `openai==1.50.0`，結果 `httpx` 自動裝到 0.28 之後直接壞掉，因為新版移除了 `proxies` 參數。解法是在 `requirements.txt` 另外鎖 `httpx<0.28`。依賴刻意保持最小，只有 `openai` 和 `python-dotenv`。
+
+## 這個迴圈做不到什麼
+
+寫完之後，我刻意測它**做不到**的事，因為後面每一層都是為了補這些缺口：
+
+| 缺口 | 現象 | 之後要補的層 |
+|---|---|---|
+| 讀寫檔案 | 只能請我貼內容 | File System |
+| 執行程式 | 只能描述怎麼做 | Code Execution、Sandbox |
+| 長期記憶 | `quit` 之後全部忘記 | AGENTS.md、Memory |
+| 可觀測性 | 說不出自己用了哪個模型、多少 token | Observability |
+
+它說不出自己的 token 用量，這點值得多想一下：**模型對自己行為的描述，本身也只是模型的輸出**，可能是錯的，而且沒有任何東西可以拿來比對。
+
+## 學到什麼
+
+模型只能**描述**動作，要**執行**動作必須透過工具；模型沒有記憶，記憶要由 harness 來管。把最陽春的版本寫出來之後，後面每一層在補什麼就很清楚了。下一篇開始讓它真的能讀寫檔案。
+
+程式碼：[Poyuchao/Harness-Engineering](https://github.com/Poyuchao/Harness-Engineering)

@@ -1,0 +1,102 @@
+---
+title: "pip install 卡住、timeout 卻沒生效：讓 agent 真的能跑程式的四個修正"
+date: "2026-10-13"
+tag: "踩坑紀錄"
+series: "agent-harness-from-scratch"
+order: 7
+excerpt: "用一個 CSV 統計任務驗證 harness，結果踩到四個坑：殺不掉的程序樹、裝錯地方的套件、被引號切壞的指令，以及無限重試的 agent。"
+draft: true
+---
+
+## 問題
+
+我用一個完整任務驗證 bash、ReAct loop 和指令政策能不能一起運作：
+
+> `sales.csv` 在 workspace 裡，計算每個數值欄位的 count、mean、median、標準差，存成 `summary.json`。需要套件就自己安裝。
+
+資料是 12 筆銷售紀錄（`month, region, units_sold, revenue`）。我先算好預期答案（樣本標準差，和 pandas 預設的 `ddof=1` 一致）：
+
+| 欄位 | count | mean | median | std |
+|---|---|---|---|---|
+| `units_sold` | 12 | 117.75 | 115.0 | 21.19 |
+| `revenue` | 12 | 4610.5 | 4490.0 | 939.96 |
+
+第一次跑，事情沒有照計畫走。
+
+## 坑一：timeout 沒生效，pip 一直跑
+
+`pip install pandas` 卡住超過 60 秒，timeout 卻沒有作用。
+
+原因是 Windows 上的 `Git\bin\bash.exe` 只是一個啟動器，它會另外開 `Git\usr\bin\bash.exe` 來執行指令。timeout 只殺掉了啟動器，真正的 bash 和 pip 還在跑，而且手上還握著 stdout/stderr 的 pipe，`communicate()` 就一直等它們結束。
+
+修正：
+
+- 直接呼叫 `usr\bin\bash.exe`，並把 `usr\bin`、`mingw64\bin` 加進 `PATH`
+- 改用 `Popen` 加 `communicate(timeout=)`，逾時時**終止整個程序樹**：Windows 用 `taskkill /F /T`，POSIX 用獨立的 process group 加 `killpg`
+- `stdin=DEVNULL`，避免指令等待互動輸入而卡住
+
+```python
+def _kill_tree(proc: subprocess.Popen) -> None:
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
+    else:
+        os.killpg(proc.pid, signal.SIGKILL)
+```
+
+## 坑二：agent 的套件裝進了 harness 的環境
+
+bash 的 `PATH` 以 harness 自己的 Python 為優先，所以 agent 執行 `pip install` 時，套件直接裝進了 **harness 的 `.venv`**。這很危險：agent 可能順手把 `httpx` 升到 0.28，而這正好會讓我鎖定的 `openai==1.50.0` 壞掉。
+
+修正：workspace 有自己的 venv（`.workspace/.venv`，第一次 import 時建立，約 5 秒），bash 的 `PATH` 以它為優先並設定 `VIRTUAL_ENV`。另外自動在 `.workspace/.gitignore` 加上 `.venv/`，否則 `git_commit` 會把整個 venv 提交進去。
+
+## 坑三：政策檢查把引號裡的指令切壞了
+
+`python -c "import a; print(1)"` 被 `;` 切成兩段，`print(1)"` 被當成指令名稱，結果被允許清單擋下。修正是讓 `_segments` 逐字元掃描，略過引號內的分隔符號。
+
+## 坑四：網路慢，agent 無限重試同一個指令
+
+查詢 PyPI 上一個套件的索引就要約 18 秒，pandas 連同依賴在 60 秒內根本裝不完。模型收到 timeout 之後，用**完全相同的參數**重試（甚至加上 `--no-cache-dir`），每次都失敗，直到把 step budget 用光。
+
+直接把全域 timeout 調高不是好辦法：真正卡死的指令（無窮迴圈、等待輸入）也要等更久才會結束，期間畫面沒有任何回饋。
+
+修正：讓 timeout 變成**每次呼叫可以指定的參數**，預設 60 秒，上限 600 秒：
+
+```python
+@tool
+def bash(command: str, timeout: int = BASH_TIMEOUT) -> str:
+    """... Pass a longer timeout for slow commands such as `pip install`
+    or `git clone`, especially when a previous attempt timed out."""
+```
+
+一般指令維持 60 秒快速失敗，慢的指令由模型自己延長。timeout 的錯誤訊息和 system prompt 都明確提示：**慢就用更長的 timeout 重試，不要重複相同的呼叫。**
+
+## 修正後的實測
+
+agent 在一個 turn 內自己完成：
+
+1. `pip install pandas numpy`，`timeout: 120` → 逾時
+2. **自己改用 `timeout: 600` 重試** → numpy 12.7 MB 以 68 kB/s 下載了 4 分 40 秒，安裝成功
+3. 用 `python -c` 跑 `df.describe()`，寫出 `summary.json`
+4. 用 `read_file` 驗證輸出 → `git_commit`
+
+<StatCards
+  items={[
+    { value: "4 個坑", label: "第一次跑任務踩到的問題" },
+    { value: "4 分 40 秒", label: "慢網路下 numpy 的下載時間" },
+    { value: "完全一致", label: "結果與預先算好的答案比對", tone: "good" }
+  ]}
+/>
+
+pandas 和 numpy 只出現在 `.workspace/.venv`，harness 的環境保持乾淨，`.venv/` 也沒有被 commit。
+
+第二次跑的時候，pandas 顯示 `Using cached`。這不是 agent 變聰明了，而是 **pip 的 HTTP 快取**：前一次被中止的嘗試已經完整下載了 pandas 的 wheel，而下載到一半的 numpy 不會進快取。
+
+## 還沒解決的部分
+
+pip 快取在使用者層級、所有 venv 共用，所以 harness 和 workspace 在這裡其實還有交集。檔案系統和權限也一樣仍然和主機共用。Python 依賴的隔離只是一小步，完整的隔離要靠下一階段的沙箱。
+
+## 學到什麼
+
+會執行程式的 agent，至少需要兩件事：**能結束整個程序樹的 timeout**，以及**和 harness 分開的依賴環境**。另外，讓模型自己決定 timeout，比我替所有指令猜一個數字更好，前提是錯誤訊息要告訴它該怎麼做。
+
+程式碼：[Poyuchao/Harness-Engineering](https://github.com/Poyuchao/Harness-Engineering)

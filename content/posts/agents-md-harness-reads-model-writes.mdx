@@ -1,0 +1,71 @@
+---
+title: "AGENTS.md：讀取交給 harness，寫入交給模型"
+date: "2026-10-05"
+tag: "Agent 架構"
+series: "agent-harness-from-scratch"
+order: 3
+excerpt: "跨 session 記憶最簡單的做法就是一個檔案。讀取很可靠，寫入卻一直走樣，原因是一個是 hard constraint，一個是 soft。"
+draft: true
+---
+
+## 問題
+
+到目前為止，只要輸入 `quit`，agent 就忘記一切，因為對話歷史只存在記憶體裡。我想要它下次打開時，還記得這個專案在做什麼、用什麼慣例、上次做到哪。
+
+最簡單的做法不是向量資料庫，而是一個檔案：**AGENTS.md**。
+
+## 設計：一邊 hard、一邊 soft
+
+| 動作 | 誰負責 | 性質 | 原因 |
+|---|---|---|---|
+| 讀取 | harness，每個 session 開始時自動載入 | Hard | 必須保證發生，不能靠模型記得去讀 |
+| 寫入 | 模型，用 `write_file` 更新 | Soft | 「什麼值得記住」需要模型判斷，很難寫成規則 |
+
+檔案放在 `.workspace/AGENTS.md`，不存在時用模板建立。模板有五段：Project Context、Conventions、Decisions、Gotchas、Active Tasks，每段用括號寫提示，讓模型換成真實內容；Active Tasks 完成後要清掉，免得模型以為工作還在進行。
+
+## 為什麼讀取不做成工具
+
+我一開始的直覺是做一個 `load_memory` 工具，但後來想清楚了：**工具是由模型決定要不要呼叫的，不保證發生。** 讀記憶必須保證發生，所以由 harness 直接讀，並放進 context：
+
+```python
+agents_md = load_agents_md()
+messages = [
+    {"role": "system", "content": SYSTEM_PROMPT},
+    {"role": "system", "content": agents_md},
+]
+```
+
+寫入則不需要新工具，AGENTS.md 只是 workspace 裡的普通檔案，模型用 `read_file` 和 `write_file` 就能處理。
+
+兩則 system message 分開放，模型讀起來是一份連續的 context，但之後在 observability 工具裡能分辨哪段是我寫的指令、哪段是記憶，方便除錯。
+
+## 預先載入的代價
+
+- **好處**：模型回答第一句之前就有專案背景，也不消耗任何工具呼叫
+- **代價**：每次呼叫都重送一次，檔案越大 token 越貴；只在 session 開始時讀一次，中途寫入要到下個 session 才重新載入
+
+所以 AGENTS.md 只適合放**精簡、長期有效**的資訊，大量的記憶要交給之後的檢索。
+
+## 實測：寫入一直走樣
+
+我用一個跨兩個 session 的任務驗證：研究 Git 的歷史，筆記放 `notes/`，最後整合成 `git-history.md`。中途退出，隔天再回來接著做。
+
+| 項目 | 結果 |
+|---|---|
+| AGENTS.md 讀取（harness 負責） | 可靠，新 session 第一句就能回答「上次做到哪」 |
+| AGENTS.md 寫入（模型負責） | 會更新，但品質不穩定 |
+
+寫入走樣的具體情況：
+
+- 要求「更新記憶檔」時，模型另外建了一個 `project_memory` 檔案，而不是寫進 AGENTS.md
+- 更新時只記了**已完成**的部分，漏掉了還沒做的段落，需要我額外提醒
+- 「成品放在 `git-history.md`」這個關鍵決定沒被記下來，續作時我得重新告訴它
+- 要求清空 Active Tasks 後，它自己加的「Current task」還留著舊描述
+
+這些全都是 soft constraint 的典型失效：模型會遵守大方向，但細節會走樣。
+
+## 學到什麼
+
+讀取必須是 hard，由 harness 保證；寫入目前是 soft，品質取決於模型。同一個檔案、兩種約束，可靠度差很多，這比任何理論都清楚地說明了為什麼「一定要發生的事要寫在程式碼裡」。要讓寫入也可靠，下一步是由 harness 決定**寫入的時機**，模型只負責提供內容。
+
+程式碼：[Poyuchao/Harness-Engineering](https://github.com/Poyuchao/Harness-Engineering)

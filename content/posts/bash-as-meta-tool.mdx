@@ -1,0 +1,82 @@
+---
+title: "為什麼我只加了一個 bash，而不是一直加工具"
+date: "2026-10-06"
+tag: "Agent 架構"
+series: "agent-harness-from-scratch"
+order: 4
+excerpt: "預定義工具永遠不夠用。給 agent 一個 bash 當 meta tool，缺什麼工具它就當場組出來；再用 tool trace 看清楚它實際跑了什麼。"
+draft: true
+---
+
+## 問題
+
+有了檔案和 git 工具之後，我很快撞到天花板。問題不只是「不能跑程式」，而是**預定義工具只涵蓋我想得到的需求**：
+
+| 需求 | 只有現有工具 | 有 shell |
+|---|---|---|
+| 某份筆記有幾行？ | 整份讀進 context 再自己數 | `wc -l` |
+| 哪些檔案提到 BitKeeper？ | 逐一讀檔、手動搜尋 | `grep -rl BitKeeper` |
+| 系統的 Python 版本？ | 只能猜 | `python --version` |
+| 執行剛寫好的 script | 做不到，無法驗證輸出 | `python script.py` |
+
+最後一項對 coding agent 是致命的：寫了程式卻不能跑，就不知道它對不對。
+
+## 一直加工具是一台跑步機
+
+直覺的解法是缺什麼補什麼：`count_lines`、`grep`、`run_python`……但每個新任務都會暴露新缺口，永遠追不完。而且每個工具的 schema 都要放進 context，工具越多越佔空間，模型也越難選對。
+
+## Meta tool：讓 agent 自己組工具
+
+換個問法：不要問「agent 該有哪些工具」，而是問「**最少的一組通用 primitive，能讓 agent 組出任何東西**是什麼」。答案是 bash。
+
+例如「Linus 在所有筆記中出現幾次」，沒有 bash 時要列目錄、逐檔讀取、讓模型自己數，而**模型數數本來就不可靠**。有了 bash，它一行就做完，只回傳一個數字：
+
+```bash
+grep -c Linus notes/*.md | awk -F: '{s+=$2} END {print s}'
+```
+
+沒有人會做一個「跨檔案計算出現次數」的工具，以後也不會有。agent 在需要的那一刻，用 bash 的基本元件當場組出來。
+
+選 bash 而不是 Python runner 的理由：到處都有、免費取得 `grep`、`awk`、`curl` 這些久經考驗的工具、能執行任何已安裝的語言（Python runner 只是它的子集）、可以用 pipe 和 redirect 組合，而且**模型在訓練中看過大量 shell，天生就會**。
+
+## 實作的設計決策
+
+| 項目 | 決策 | 理由 |
+|---|---|---|
+| 執行方式 | `bash -c "<command>"`，完整 shell 解譯 | pipe、redirect、chaining 原生可用 |
+| 工作目錄 | `.workspace/` | 和檔案、git 工具一致 |
+| Timeout | 60 秒（git 是 10 秒） | 要容納 `pip install`、`git clone` |
+| 輸出 | stdout 為主，stderr 非空時附在後面 | 程式常在兩邊都輸出有用資訊 |
+| 錯誤標示 | `[bash exited with code N]` | 方括號標示這是 harness 產生的資訊 |
+| 工具名稱 | `bash` | 符合模型對 shell 的既有認知 |
+
+方括號那一項很重要：如果只給模型 stdout，它可能看到一段像是成功的輸出，卻沒發現指令其實以錯誤結束。
+
+## Windows 上的兩個坑
+
+- `subprocess.run(..., shell=True)` 在 Windows 用的是 `cmd.exe`，不是 bash，所以要明確呼叫 `[BASH, "-c", command]`
+- `PATH` 上的 `bash` 其實是 WSL 的啟動器，而我機器上的 WSL 只有 `docker-desktop` 這個 distro，不能用。所以改成從 `git.exe` 的位置推導出 Git Bash，裡面自帶 GNU 的 `grep`、`awk`、`wc`
+
+## Tool trace：不要只相信模型的轉述
+
+原本工具結果只進 `messages`，我在終端機只看得到**模型的轉述**。但轉述可能出錯，甚至是編的，我就遇過它宣稱更新了 AGENTS.md，實際上沒有。所以我讓每次工具呼叫都印出實際執行的內容：
+
+```python
+def _trace(name: str, args: dict, result: str) -> None:
+    print(f"\n  [tool] {name}({json.dumps(args, ensure_ascii=False)})")
+    lines = result.splitlines() or [""]
+    for line in lines[:TRACE_MAX_LINES]:
+        print(f"  | {line}")
+```
+
+這是整個 harness 最早的 observability：**看實際發生了什麼，而不是看模型說了什麼。**
+
+## 學到什麼
+
+bash 直接移除了工具的天花板，也第一次讓 agent 能「寫、跑、看錯誤、再改」。但它也帶來兩個新問題：`_resolve_path` 的保護被繞過了（`cd ..` 就能離開 workspace），而且每一輪還是只能呼叫一次工具，「寫完再執行」要我下兩次指令。下一篇用 ReAct loop 解決後者。
+
+<Callout type="limit" title="安全提醒">
+到這一步為止，bash 能做任何你在終端機能做的事，路徑也沒有被限制。在加上政策檢查和沙箱之前，不要讓它處理你不信任的輸入。
+</Callout>
+
+程式碼：[Poyuchao/Harness-Engineering](https://github.com/Poyuchao/Harness-Engineering)

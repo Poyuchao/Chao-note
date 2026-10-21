@@ -1,0 +1,77 @@
+---
+title: "我建了 180 題評測集，發現 CRAG 準確率沒變、成本卻多十倍"
+date: "2026-10-18"
+tag: "RAG"
+series: "rag-basics-to-agentic"
+project: "ResumePilot"
+excerpt: "五種做法比較準確率、幻覺率與證據有效率。最複雜的那個，最後沒有上線。"
+featured: true
+draft: true
+# 精選卡用：與內文 MethodTable 的 calls、StatCards 的 items 相同，改內文時記得一起改
+featuredChart:
+  label: "每題呼叫次數"
+  bars:
+    - { id: "A", value: 1 }
+    - { id: "B", value: 1 }
+    - { id: "C", value: 9 }
+    - { id: "D", value: 29 }
+    - { id: "E", value: 34 }
+featuredStats:
+  - { value: "76–82%", label: "五種做法的準確率" }
+  - { value: "26%", label: "A 引用的證據不在履歷裡", tone: "warn" }
+  - { value: "99%", label: "D 的證據有效率", tone: "good" }
+---
+
+## 問題
+
+ResumePilot 要判斷一份履歷是否符合職缺的每一條要求。原本的做法是把整份 JD 當成一個問題，檢索履歷中最像的 3 段，再一次判斷所有需求。它看起來能用，但我說不出它到底準不準。
+
+## 怎麼建評測集
+
+每題是一份履歷加一條職缺要求，答案只有三種：符合、部分符合、缺少，大約 180 題。
+
+為了讓答案沒有模糊空間，我把幾份履歷刻意刪改。例如刪掉所有 MCP 相關的內容，這時職缺要求 MCP，答案就一定是「缺少」；系統只要說「符合」，就是編的。
+
+## 五種做法
+
+<MethodTable
+  rows={[
+    { id: "A", how: "不檢索，整份履歷直接給 LLM，一次判斷所有需求", calls: 1 },
+    { id: "B", how: "整份 JD 當一個問題，檢索履歷最像的 3 段，一次判斷（原本的做法）", calls: 1 },
+    { id: "C", how: "把 JD 拆成一條條需求，每條各自檢索 3 段、各自判斷", calls: 9 },
+    { id: "D", how: "C 加上 CRAG：段落先評分，不相關就改寫查詢重搜，最多 2 次", calls: 29 },
+    { id: "E", how: "D 加上驗證：判完再檢查證據是否真的證明這項能力", calls: 34 }
+  ]}
+/>
+
+D 的核心是 CRAG：檢索到的段落先逐段評分，全都不相關就改寫查詢再查，最多兩次。
+
+```python
+for attempt in range(MAX_RETRIES + 1):
+    chunks = retrieve(query, k=3)
+    graded = [grade(c, requirement) for c in chunks]  # 相關 / 不確定 / 不相關
+    if any(g == "relevant" for g in graded):
+        return judge(requirement, chunks)
+    query = rewrite(query)  # 例如補上全名 Model Context Protocol
+return "缺少"
+```
+
+## 結果
+
+<StatCards
+  items={[
+    { value: "76–82%", label: "五種做法的準確率" },
+    { value: "26%", label: "A 引用的證據不在履歷裡", tone: "warn" },
+    { value: "99%", label: "D 的證據有效率", tone: "good" }
+  ]}
+/>
+
+五種做法的準確率差不多。最高的是不檢索、整份履歷直接判斷（81.5%），但它有 26% 的證據是編的。CRAG 的證據有效率到 99%，代價是每題約 29 次呼叫、token 約十倍。
+
+<Callout type="limit" title="限制">
+資料量小、只測了 gpt-4o-mini，保留的驗證集還沒跑，所以這份結果只看方向。
+</Callout>
+
+## 學到什麼
+
+準確率不是唯一的指標。分數最高的做法最會編證據，最誠實的做法貴了十倍。準確率差不多、成本差十倍，所以我沒有上線 CRAG。下一步是跑保留的驗證集，確認這個方向在更多資料上還成立。
